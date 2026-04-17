@@ -1,0 +1,22 @@
+__include__: [
+  './rtdetr_r18vd_6x_visdrone.yml',
+]
+
+
+output_dir: ./output/rtdetr_r18vd_6x_visdrone_p2
+
+
+PResNet:
+  return_idx: [0, 1, 2, 3]
+
+
+HybridEncoder:
+  in_channels: [64, 128, 256, 512]
+  feat_strides: [4, 8, 16, 32]
+  use_encoder_idx: [3]
+
+
+RTDETRTransformer:
+  feat_channels: [256, 256, 256, 256]
+  feat_strides: [4, 8, 16, 32]
+  num_levels: 4

@@ -1,0 +1,51 @@
+__include__: [
+  './rtdetr_r18vd_6x_visdrone.yml',
+]
+
+
+output_dir: ./output/rtdetr_litegate_r18_6x_visdrone
+
+
+RTDETR:
+  backbone: LitePResNet
+
+
+LitePResNet:
+  depth: 18
+  variant: d
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+  return_idx: [0, 1, 2, 3]
+  enhance_act: silu
+  enhance_expansion: 0.5
+  enhance_stages: [0, 1, 2]
+  attn_ratio: 0.25
+  high_freq_stages: [0, 1]
+  linear_attention_stages: [2]
+
+
+HybridEncoder:
+  in_channels: [64, 128, 256, 512]
+  feat_strides: [4, 8, 16, 32]
+  hidden_dim: 192
+  nhead: 6
+  dim_feedforward: 768
+  expansion: 0.5
+  use_encoder_idx: [3]
+  detail_enhance_idx: [0]
+  fusion_gate: True
+  fusion_gate_hidden_ratio: 0.5
+
+
+RTDETRTransformer:
+  feat_channels: [192, 192, 192, 192]
+  feat_strides: [4, 8, 16, 32]
+  hidden_dim: 192
+  nhead: 6
+  num_levels: 4
+  dim_feedforward: 768
+  num_decoder_points: 4
+  eval_idx: -1
+  num_decoder_layers: 3
+  num_denoising: 100

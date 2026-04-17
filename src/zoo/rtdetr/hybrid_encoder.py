@@ -112,6 +112,45 @@ class CSPRepLayer(nn.Module):
         return self.conv3(x_1 + x_2)
 
 
+class DetailEnhanceBlock(nn.Module):
+    def __init__(self, channels, act="silu"):
+        super().__init__()
+        self.refine = ConvNormLayer(channels, channels, 3, 1, act=act)
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            get_activation(act),
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        low_freq = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        high_freq = x - low_freq
+        gate = self.gate(torch.concat([x, high_freq], dim=1))
+        return x + self.refine(high_freq) * gate
+
+
+class ContextGateFusion(nn.Module):
+    def __init__(self, channels, hidden_ratio=0.5, act="silu"):
+        super().__init__()
+        hidden_channels = max(16, int(channels * hidden_ratio))
+        self.local = ConvNormLayer(channels * 2, channels, 1, 1, act=act)
+        self.context = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden_channels, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            get_activation(act),
+            nn.Conv2d(hidden_channels, channels * 2, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, feat_a, feat_b):
+        joint = self.local(torch.concat([feat_a, feat_b], dim=1))
+        gate_a, gate_b = self.context(joint).chunk(2, dim=1)
+        return feat_a * (1 + gate_a), feat_b * (1 + gate_b)
+
+
 # transformer
 class TransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -195,6 +234,9 @@ class HybridEncoder(nn.Module):
                  expansion=1.0,
                  depth_mult=1.0,
                  act='silu',
+                 detail_enhance_idx=None,
+                 fusion_gate=False,
+                 fusion_gate_hidden_ratio=0.5,
                  eval_spatial_size=None):
         super().__init__()
         self.in_channels = in_channels
@@ -204,6 +246,8 @@ class HybridEncoder(nn.Module):
         self.num_encoder_layers = num_encoder_layers
         self.pe_temperature = pe_temperature
         self.eval_spatial_size = eval_spatial_size
+        self.detail_enhance_idx = set(detail_enhance_idx or [])
+        self.fusion_gate = fusion_gate
 
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
@@ -217,6 +261,11 @@ class HybridEncoder(nn.Module):
                     nn.BatchNorm2d(hidden_dim)
                 )
             )
+
+        self.detail_enhancers = nn.ModuleList([
+            DetailEnhanceBlock(hidden_dim, act=act) if idx in self.detail_enhance_idx else nn.Identity()
+            for idx in range(len(in_channels))
+        ])
 
         # encoder transformer
         encoder_layer = TransformerEncoderLayer(
@@ -233,21 +282,31 @@ class HybridEncoder(nn.Module):
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
         self.fpn_blocks = nn.ModuleList()
+        self.top_down_gates = nn.ModuleList()
         for _ in range(len(in_channels) - 1, 0, -1):
             self.lateral_convs.append(ConvNormLayer(hidden_dim, hidden_dim, 1, 1, act=act))
             self.fpn_blocks.append(
                 CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)
             )
+            self.top_down_gates.append(
+                ContextGateFusion(hidden_dim, hidden_ratio=fusion_gate_hidden_ratio, act=act)
+                if fusion_gate else nn.Identity()
+            )
 
         # bottom-up pan
         self.downsample_convs = nn.ModuleList()
         self.pan_blocks = nn.ModuleList()
+        self.bottom_up_gates = nn.ModuleList()
         for _ in range(len(in_channels) - 1):
             self.downsample_convs.append(
                 ConvNormLayer(hidden_dim, hidden_dim, 3, 2, act=act)
             )
             self.pan_blocks.append(
                 CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)
+            )
+            self.bottom_up_gates.append(
+                ContextGateFusion(hidden_dim, hidden_ratio=fusion_gate_hidden_ratio, act=act)
+                if fusion_gate else nn.Identity()
             )
 
         self._reset_parameters()
@@ -283,6 +342,7 @@ class HybridEncoder(nn.Module):
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        proj_feats = [self.detail_enhancers[i](feat) for i, feat in enumerate(proj_feats)]
         
         # encoder
         if self.num_encoder_layers > 0:
@@ -308,6 +368,8 @@ class HybridEncoder(nn.Module):
             feat_high = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_high)
             inner_outs[0] = feat_high
             upsample_feat = F.interpolate(feat_high, scale_factor=2., mode='nearest')
+            if self.fusion_gate:
+                upsample_feat, feat_low = self.top_down_gates[len(self.in_channels) - 1 - idx](upsample_feat, feat_low)
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
             inner_outs.insert(0, inner_out)
 
@@ -316,6 +378,8 @@ class HybridEncoder(nn.Module):
             feat_low = outs[-1]
             feat_high = inner_outs[idx + 1]
             downsample_feat = self.downsample_convs[idx](feat_low)
+            if self.fusion_gate:
+                downsample_feat, feat_high = self.bottom_up_gates[idx](downsample_feat, feat_high)
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_high], dim=1))
             outs.append(out)
 

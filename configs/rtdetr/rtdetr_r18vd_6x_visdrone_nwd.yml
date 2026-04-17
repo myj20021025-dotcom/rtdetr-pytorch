@@ -1,0 +1,17 @@
+__include__: [
+  './rtdetr_r18vd_6x_visdrone.yml',
+]
+
+
+output_dir: ./output/rtdetr_r18vd_6x_visdrone_nwd
+
+
+SetCriterion:
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_nwd: 2}
+  nwd_constant: 0.02
+  vfl_nwd_weight: 0.5
+
+  matcher:
+    type: HungarianMatcher
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2, cost_nwd: 2}
+    nwd_constant: 0.02

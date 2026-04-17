@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
-from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou, pairwise_normalized_wasserstein_similarity
 
 from src.core import register
 
@@ -27,7 +27,7 @@ class HungarianMatcher(nn.Module):
 
     __share__ = ['use_focal_loss', ]
 
-    def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0):
+    def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0, nwd_constant=0.02):
         """Creates the matcher
 
         Params:
@@ -39,12 +39,15 @@ class HungarianMatcher(nn.Module):
         self.cost_class = weight_dict['cost_class']
         self.cost_bbox = weight_dict['cost_bbox']
         self.cost_giou = weight_dict['cost_giou']
+        self.cost_nwd = weight_dict.get('cost_nwd', 0.0)
 
         self.use_focal_loss = use_focal_loss
         self.alpha = alpha
         self.gamma = gamma
+        self.nwd_constant = nwd_constant
 
-        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs cant be 0"
+        assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0 or self.cost_nwd != 0, \
+            "all costs cant be 0"
 
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -97,9 +100,15 @@ class HungarianMatcher(nn.Module):
 
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+
+        cost_nwd = 0
+        if self.cost_nwd:
+            cost_nwd = -pairwise_normalized_wasserstein_similarity(
+                out_bbox, tgt_bbox, constant=self.nwd_constant)
         
         # Final cost matrix
-        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + \
+            self.cost_giou * cost_giou + self.cost_nwd * cost_nwd
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]

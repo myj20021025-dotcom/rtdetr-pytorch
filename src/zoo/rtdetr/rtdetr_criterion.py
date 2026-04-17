@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import torchvision
 
 # from torchvision.ops import box_convert, generalized_box_iou
-from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
+from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou, aligned_normalized_wasserstein_similarity
 
 from src.misc.dist import get_world_size, is_dist_available_and_initialized
 from src.core import register
@@ -29,7 +29,8 @@ class SetCriterion(nn.Module):
     __share__ = ['num_classes', ]
     __inject__ = ['matcher', ]
 
-    def __init__(self, matcher, weight_dict, losses, alpha=0.2, gamma=2.0, eos_coef=1e-4, num_classes=80):
+    def __init__(self, matcher, weight_dict, losses, alpha=0.2, gamma=2.0, eos_coef=1e-4,
+                 num_classes=80, nwd_constant=0.02, vfl_nwd_weight=0.0):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -50,6 +51,8 @@ class SetCriterion(nn.Module):
 
         self.alpha = alpha
         self.gamma = gamma
+        self.nwd_constant = nwd_constant
+        self.vfl_nwd_weight = min(max(vfl_nwd_weight, 0.0), 1.0)
 
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
@@ -116,6 +119,11 @@ class SetCriterion(nn.Module):
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
         ious = torch.diag(ious).detach()
+        quality_score = ious
+        if self.vfl_nwd_weight > 0:
+            nwd_score = aligned_normalized_wasserstein_similarity(
+                src_boxes, target_boxes, constant=self.nwd_constant).detach()
+            quality_score = (1 - self.vfl_nwd_weight) * ious + self.vfl_nwd_weight * nwd_score
 
         src_logits = outputs['pred_logits']
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
@@ -125,7 +133,7 @@ class SetCriterion(nn.Module):
         target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
 
         target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
-        target_score_o[idx] = ious.to(target_score_o.dtype)
+        target_score_o[idx] = quality_score.to(target_score_o.dtype)
         target_score = target_score_o.unsqueeze(-1) * target
 
         pred_score = F.sigmoid(src_logits).detach()
@@ -168,6 +176,11 @@ class SetCriterion(nn.Module):
                 box_cxcywh_to_xyxy(src_boxes),
                 box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+        if self.weight_dict.get('loss_nwd', 0.0):
+            loss_nwd = 1 - aligned_normalized_wasserstein_similarity(
+                src_boxes, target_boxes, constant=self.nwd_constant)
+            losses['loss_nwd'] = loss_nwd.sum() / num_boxes
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
@@ -335,7 +348,6 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
-
 
 
 

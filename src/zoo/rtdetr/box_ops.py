@@ -62,6 +62,32 @@ def generalized_box_iou(boxes1, boxes2):
     return iou - (area - union) / area
 
 
+def _box_center_wh_distance(boxes1, boxes2):
+    center_distance = ((boxes1[..., :2] - boxes2[..., :2]) ** 2).sum(dim=-1)
+    wh_distance = ((boxes1[..., 2:] - boxes2[..., 2:]) ** 2).sum(dim=-1) * 0.25
+    return center_distance + wh_distance
+
+
+def pairwise_normalized_wasserstein_similarity(boxes1, boxes2, constant=0.02, eps=1e-7):
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]))
+
+    distance = _box_center_wh_distance(boxes1[:, None, :], boxes2[None, :, :])
+    distance = torch.sqrt(distance + eps)
+    constant = torch.as_tensor(constant, dtype=boxes1.dtype, device=boxes1.device).clamp_min(eps)
+    return torch.exp(-distance / constant)
+
+
+def aligned_normalized_wasserstein_similarity(boxes1, boxes2, constant=0.02, eps=1e-7):
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0],))
+
+    distance = _box_center_wh_distance(boxes1, boxes2)
+    distance = torch.sqrt(distance + eps)
+    constant = torch.as_tensor(constant, dtype=boxes1.dtype, device=boxes1.device).clamp_min(eps)
+    return torch.exp(-distance / constant)
+
+
 def masks_to_boxes(masks):
     """Compute the bounding boxes around the provided masks
 
